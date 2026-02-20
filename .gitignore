@@ -1,6 +1,8 @@
 
 # ignore the venv directory
 venv/
+
+myenv/
 # ignore the .vscode directory
 .vscode/
 # ignore the .idea directory
