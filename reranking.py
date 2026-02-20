@@ -30,8 +30,8 @@ pdf_texts = [p.extract_text().strip() for p in reader.pages]
 # Filter the empty strings
 pdf_texts = [text for text in pdf_texts if text]
 
-from langchain.text_splitter import (
-    RecursiveCharacterTextSplitter,
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters.sentence_transformers import (
     SentenceTransformersTokenTextSplitter,
 )
 
