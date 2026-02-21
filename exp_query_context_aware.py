@@ -9,6 +9,50 @@ from pypdf import PdfReader
 import numpy as np
 import umap
 
+# experimental - retrieve context-aware queries
+
+def generate_context_aware_queries(user_query, retrieved_docs, model="gpt-3.5-turbo"):
+    """
+    Generate grounded, context-aware query expansions based on the user's question
+    AND the content of the initially retrieved documents.
+    """
+
+    context = "\n\n".join(retrieved_docs[:3])  # keep it small to avoid prompt bloat
+
+    prompt = f"""
+    You are a financial analysis assistant working with annual report data.
+
+    The user asked:
+    "{user_query}"
+
+    Below are excerpts retrieved from the document:
+    ---
+    {context}
+    ---
+
+    Based on BOTH the user question and the retrieved content,
+    generate up to five follow-up questions that:
+    - explore different angles of the same topic,
+    - stay grounded in the retrieved content,
+    - avoid speculation,
+    - are concise and single-topic,
+    - help retrieve more relevant information from the document.
+
+    List each question on a separate line without numbering.
+    """
+
+    messages = [
+        {"role": "system", "content": "You generate grounded financial queries."},
+        {"role": "user", "content": prompt},
+    ]
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+    )
+
+    content = response.choices[0].message.content.strip().split("\n")
+    return [q.strip() for q in content if q.strip()]
 
 # Load environment variables from .env file
 load_dotenv()
@@ -62,16 +106,28 @@ ids = [str(i) for i in range(len(token_split_texts))]
 chroma_collection.add(ids=ids, documents=token_split_texts)
 chroma_collection.count()
 
-query = "What business sector is the most profitable?"
+# output queries to compare
+query_compare = []
+
+# query for vector search
+query = "What sectors of the tech industry does Microsoft operate in?"
+
+# collect queries to compare
+query_compare.append(query)
 
 results = chroma_collection.query(query_texts=[query], n_results=5)
 retrieved_documents = results["documents"][0]
+
+aug_queries = generate_context_aware_queries(query, retrieved_documents)
+
+# compare output queries
+query_compare.extend(aug_queries)
 
 # for document in retrieved_documents:
 #     print(word_wrap(document))
 #     print("\n")
 
-
+# deprecated
 def generate_multi_query(query, model="gpt-3.5-turbo"):
 
     prompt = """
@@ -99,21 +155,22 @@ def generate_multi_query(query, model="gpt-3.5-turbo"):
     content = content.split("\n")
     return content
 
-
+# query for final answer
 original_query = (
-    "What details can you provide about the factors that led to profitability?"
+    "Which sector of the tech industry shows the highest potential for growth for Microsoft over the next 5 years?"
 )
-aug_queries = generate_multi_query(original_query)
+
+# output queries to compare
+query_compare.append(original_query)
+# aug_queries = generate_multi_query(original_query) # deprecated
+print("query_compare: ", query_compare)
 
 # 1. First step show the augmented queries
 for query in aug_queries:
     print("\n", query)
 
 # 2. concatenate the original query with the augmented queries
-joint_query = [
-    original_query
-] + aug_queries  # original query is in a list because chroma can actually handle multiple queries, so we add it in a list
-
+joint_query = [original_query] + aug_queries  # original query is in a list because chroma can actually handle multiple queries, so we add it in a list
 # print("======> \n\n", joint_query)
 
 results = chroma_collection.query(
@@ -193,6 +250,8 @@ plt.scatter(
 plt.gca().set_aspect("equal", "datalim")
 plt.title(f"{original_query}")
 plt.axis("on")
-plt.savefig("./output_graphs/expansion_queries_plot.png", bbox_inches="tight")
+plt.savefig("./output_graphs/expansion_queries_plot_context.png", bbox_inches="tight")
 plt.close()
+
+
 

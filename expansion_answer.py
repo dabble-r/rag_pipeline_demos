@@ -29,8 +29,8 @@ pdf_texts = [text for text in pdf_texts if text]
 # split the text into smaller chunks
 
 
-from langchain.text_splitter import (
-    RecursiveCharacterTextSplitter,
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters.sentence_transformers import (
     SentenceTransformersTokenTextSplitter,
 )
 
@@ -103,7 +103,7 @@ original_query = "What was the total profit for the year, and how does it compar
 hypothetical_answer = augment_query_generated(original_query)
 
 joint_query = f"{original_query} {hypothetical_answer}"
-print(word_wrap(joint_query))
+print("jont query: ",word_wrap(joint_query))
 
 results = chroma_collection.query(
     query_texts=joint_query, n_results=5, include=["documents", "embeddings"]
@@ -134,6 +134,8 @@ projected_retrieved_embeddings = project_embeddings(
     retrieved_embeddings, umap_transform
 )
 
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend for headless/terminal
 import matplotlib.pyplot as plt
 
 # Plot the projected query and retrieved documents in the embedding space
@@ -169,5 +171,6 @@ plt.scatter(
 
 plt.gca().set_aspect("equal", "datalim")
 plt.title(f"{original_query}")
-plt.axis("off")
-plt.show()  # display the plot
+plt.axis("on")
+plt.savefig("./output_graphs/expansion_answer_plot.png", bbox_inches="tight")
+plt.close()
