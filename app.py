@@ -51,9 +51,8 @@ if st.button("Query") and st.session_state.open_api_key:
           f.write(st.session_state.pdf_path.getvalue())
 
         result = rag_pipeline(
-            "answer",
             st.session_state.query,
-            pdf_path=full_path,
+            full_path,
             openai_api_key=st.session_state.open_api_key,
         )
         st.write(result)
