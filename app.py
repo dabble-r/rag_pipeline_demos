@@ -60,5 +60,5 @@ if st.button("Query") and st.session_state.open_api_key:
     else:
         st.write("Please upload a PDF file")
 elif not st.session_state.open_api_key:
-    st.write("Please enter your OpenAi key")
+    st.write("Please enter your OpenAi key then submit query")
 
