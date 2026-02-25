@@ -46,8 +46,13 @@ def rag_pipeline(
     from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
 
     load_dotenv()
-    os.environ["OPENAI_API_KEY"] = openai_api_key
-    client = OpenAI(api_key=openai_api_key)
+    # Normalize API key: strip whitespace; fall back to env if None or empty
+    key = (openai_api_key or "").strip() or os.getenv("OPENAI_API_KEY") or ""
+    key = key.strip()
+    if not key:
+        raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY in .env or pass openai_api_key=...")
+    os.environ["OPENAI_API_KEY"] = key
+    client = OpenAI(api_key=key)
 
     # ---------------------------------------------------------------------------
     # MODEL ROUTER
