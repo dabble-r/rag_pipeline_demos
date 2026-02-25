@@ -1,41 +1,89 @@
-<!-- @format -->
-# Welcome to The AI Guild 🚀
+# Advanced RAG Techniques
 
-**This code is a part of a module in our vibrant AI community 🚀[Join the AI Guild Community](https://bit.ly/ai-guild-join), where like-minded entrepreneurs and programmers come together to build real-world AI-based solutions.**
+RAG (retrieval-augmented generation) over glaze and ceramics recipe PDFs: parse documents (text layer + optional OCR), index in ChromaDB, retrieve with optional query expansion, rerank with a cross-encoder, and answer with GPT.
 
-### What is The AI Guild?
-The AI Guild is a collaborative community designed for developers, tech enthusiasts, and entrepreneurs who want to **build practical AI tools** and solutions. Whether you’re just starting or looking to level up your skills, this is the place to dive deeper into AI in a supportive, hands-on environment.
+---
 
-### Why Join Us?
-- **Collaborate with Like-Minded Builders**: Work alongside a community of individuals passionate about AI, sharing ideas and solving real-world problems together.
-- **Access to Exclusive Resources**: Gain entry to our Code & Template Vault, a collection of ready-to-use code snippets, templates, and AI projects.
-- **Guided Learning Paths**: Follow structured paths, from AI Basics for Builders to advanced classes like AI Solutions Lab, designed to help you apply your knowledge.
-- **Weekly Live Calls & Q&A**: Get direct support, feedback, and guidance during live sessions with the community.
-- **Real-World AI Projects**: Work on projects that make an impact, learn from others, and showcase your work.
+## Key components
 
-### Success Stories
-Here’s what some of our members are saying:
-- **"Joining The AI Guild has accelerated my learning. I’ve already built my first AI chatbot with the help of the community!"**
-- **"The live calls and feedback have been game-changers. I’ve implemented AI automation in my business, saving hours each week."**
+### `exp_query_final_cond.py` — RAG pipeline
 
-### Who is This For?
-If you’re eager to:
-- Build AI tools that solve real problems
-- Collaborate and learn from experienced AI practitioners
-- Stay up-to-date with the latest in AI development
-- Turn your coding skills into actionable solutions
+Single-module pipeline used by the app and runnable from the CLI. It implements:
 
-Then **The AI Guild** is the perfect fit for you.
+- **Parse → chunks**
+  - **`parse_pdf_to_chunks_proposed`**: For each page, uses PyMuPDF text; if too short, falls back to Tesseract OCR. Splits into lines (preserving blanks), then applies a **dynamic parse strategy** (document-derived percentiles for alnum ratio, same-char run, repeat-pattern) to drop garbage lines while keeping valid content.
+  - **Ingredient–quantity handling**: Lines in the form `"ingredient _______________ quantity"` are protected from being dropped and are parsed into `(ingredient, quantity)` pairs; these are stored in chunk metadata as `ingredient_quantities` (JSON string for ChromaDB).
+- **Index**: Chunks are embedded with Sentence Transformers and stored in ChromaDB (collection name configurable).
+- **Retrieval**: Initial query; then **conditional query expansion** — if the question is classified as OPEN or initial results are few, GPT generates extra queries; joint retrieval over original + expanded queries.
+- **Rerank**: Cross-encoder (`ms-marco-MiniLM-L-6-v2`) reranks retrieved docs; optional distance threshold before rerank.
+- **Answer**: Top reranked docs are passed to GPT (e.g. gpt-4o) for a single, cited answer.
 
-### Frequently Asked Questions
-- **Q: Do I need to be an expert to join?**
-  - **A:** Not at all! The AI Guild is designed for all skill levels, from beginners to advanced developers.
-- **Q: Will I get personalized support?**
-  - **A:** Yes! You’ll have access to live Q&A sessions and direct feedback on your projects.
-- **Q: What kind of projects can I work on?**
-  - **A:** You can start with small projects like chatbots and automation tools, and progress to more advanced AI solutions tailored to your interests.
+**Main entrypoint:** `rag_pipeline(user_query, pdf_path, collection_name=..., top_k_rerank=..., ...)`  
+**CLI:** `python exp_query_final_cond.py` (uses `OPENAI_API_KEY` from env and a default query/PDF; edit `__main__` to change).
 
-### How to Get Started
-Want to dive deeper and get the full experience? 🚀[Join the AI Guild Community](https://bit.ly/ai-guild-join) and unlock all the benefits of our growing community.
+---
 
-We look forward to seeing what you’ll build with us!
+### `app.py` — Streamlit UI
+
+- **Glaze Recipe RAG** title and a text input for the user query.
+- **Sidebar**: OpenAI API key (form), PDF upload (saved under `uploaded_pdfs/`).
+- **Query button**: Runs `rag_pipeline(user_query, saved_pdf_path, openai_api_key=...)` and displays the returned answer. Requires key and an uploaded PDF.
+
+**Run:** `streamlit run app.py`
+
+---
+
+## Setup
+
+1. **Python 3.10+** and a virtualenv recommended.
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+   Key deps: `chromadb`, `sentence-transformers`, `openai`, `PyMuPDF`, `pytesseract`, `streamlit`, `python-dotenv`.
+3. **Optional — OCR:** For PDFs with little or no text layer, install Tesseract (e.g. `apt install tesseract-ocr` on Linux). OCR is used only when page text length is below a threshold.
+4. **OpenAI:** Set `OPENAI_API_KEY` in `.env` or enter it in the app sidebar.
+
+---
+
+## Running
+
+- **Web app:**  
+  `streamlit run app.py`  
+  Then open the URL (e.g. http://localhost:8501), add your API key and a PDF, type a query, and click Query.
+
+- **CLI (script):**  
+  Set `OPENAI_API_KEY` in `.env`, then:
+  ```bash
+  python exp_query_final_cond.py
+  ```
+  Edit the `rag_pipeline(...)` call in the `if __name__ == "__main__":` block to change the question or PDF path (e.g. `data/recipes_kc.pdf`).
+
+---
+
+## Project layout
+
+| Path | Purpose |
+|------|--------|
+| `exp_query_final_cond.py` | RAG pipeline (parse, index, expand, retrieve, rerank, answer). |
+| `app.py` | Streamlit UI that calls `rag_pipeline`. |
+| `requirements.txt` | Python dependencies (ChromaDB, sentence-transformers, OpenAI, PyMuPDF, Tesseract, Streamlit, etc.). |
+| `data/` | Sample PDFs (e.g. glaze recipes); gitignored. |
+| `.env` | `OPENAI_API_KEY`; gitignored. |
+| `md_chat/` | Notes (e.g. `tesseraact_ocr.md` on OCR/parse strategy and ingredient-quantity handling; `parse_text_pdf.md`). |
+
+---
+
+## Configuration
+
+Pipeline behavior is controlled by `rag_pipeline` arguments, for example:
+
+- `collection_name` — ChromaDB collection.
+- `top_k_rerank` — Number of docs kept after rerank (default 5).
+- `initial_n_results`, `n_results_per_query` — Retrieval sizes.
+- `expand_threshold` — Expand queries if initial doc count is below this (and/or if question is OPEN).
+- `min_sim_threshold` — Optional ChromaDB distance filter before rerank.
+- `cross_encoder_model` — Reranker model name.
+- `openai_api_key` — Override for API key.
+
+Parse/OCR options live inside the pipeline (e.g. `use_ocr_fallback`, `dpi`, `ocr_min_len`, and the dynamic-strategy percentiles in `parse_pdf_to_chunks_proposed` / `_apply_dynamic_strategy`).
