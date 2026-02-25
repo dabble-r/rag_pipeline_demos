@@ -50,7 +50,7 @@ if st.button("Query") and st.session_state.open_api_key:
         with open(full_path, "wb") as f:
           f.write(st.session_state.pdf_path.getvalue())
 
-        result = rag_pipeline(st.session_state.query, pdf_path=full_path)
+        result = rag_pipeline(st.session_state.query, pdf_path=full_path, openai_api_key=st.session_state.open_api_key)
         st.write(result)
     else:
         st.write("Please upload a PDF file")

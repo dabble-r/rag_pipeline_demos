@@ -46,7 +46,7 @@ def rag_pipeline(
     from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
 
     load_dotenv()
-    client = OpenAI(api_key=openai_api_key or os.getenv("OPENAI_API_KEY"))
+    client = OpenAI(api_key=openai_api_key)
 
     # ---------------------------------------------------------------------------
     # MODEL ROUTER
