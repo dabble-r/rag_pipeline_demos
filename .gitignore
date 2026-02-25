@@ -5,9 +5,24 @@ myenv/
 
 # ignore the .vscode directory
 .vscode/
+
 # ignore the .idea directory
 .idea/
+
 # ignore the .env file
 .env
 
+#data directory
+data/
+
+#uploaded PDFs directory
+uploaded_pdfs/
+
+#ignore the __pycache__ directory 
 __pycache__/
+
+#md chat
+md_chat/
+
+# output graph
+output_graphs/
