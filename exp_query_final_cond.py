@@ -609,10 +609,11 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     openai_api_key = os.getenv("OPENAI_API_KEY")
+    #print("openai_api_key: ", openai_api_key)
 
     result = rag_pipeline(
-        "Which materials tend to produce crystals in a glaze?",
-        "data/ceramics.pdf",
+        "What is the recipe for temmoku glaze?",
+        "data/recipes.pdf",
         openai_api_key=openai_api_key,
     )
     print("result: ", result)
