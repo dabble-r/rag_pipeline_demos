@@ -105,7 +105,7 @@ Provide one concise, direct answer. Do not speculate beyond the excerpts."""
 
 PDF_PATH = "data/recipes.pdf"
 COLLECTION_NAME = "microsoft-collection"
-INITIAL_QUERY = "What are the ingredients in a typical ceramic glaze composition?"
+INITIAL_QUERY = "What is the recipe for temmoku glaze?"
 ORIGINAL_QUERY = (
     "What is the recipe for temmoku glaze?"
 )

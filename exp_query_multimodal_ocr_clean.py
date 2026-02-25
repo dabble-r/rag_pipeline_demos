@@ -1,21 +1,14 @@
 """
-FULL RAG PIPELINE WITH:
-- Layout-aware PDF parsing (PyMuPDF)
-- Image + caption detection
-- Optional OCR on images
-- Figure chunks + section chunks
-- Embedding + metadata indexing in Chroma
-- Retrieval → query expansion → reranking → final LLM answer
-
-Dependencies (Python: see requirements.txt):
-- OPENAI_API_KEY in .env for LLM and query expansion.
-- Optional: Tesseract OCR (system binary) for image text extraction.
-  If missing, OCR is skipped and figure chunks use caption + nearby text only.
-  Install: e.g. apt install tesseract-ocr (Debian/Ubuntu).
+RAG PIPELINE WITH FIXES:
+1) Use ORIGINAL_QUERY for initial retrieval + expansion
+2) Fix system prompt domain for query expansion
+3) Include/use metadatas, prefer section chunks for recipe-like questions
+4) Basic OCR cleaning + downweight figure chunks in retrieval
 """
 
 import os
 import io
+import re
 import numpy as np
 from dotenv import load_dotenv
 from PIL import Image
@@ -36,6 +29,22 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # PDF → layout-aware chunks (figures + captions + OCR + section text)
 # ---------------------------------------------------------------------------
 
+def clean_ocr_text(text: str) -> str:
+    """Basic OCR cleaning: remove very short/noisy lines."""
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # discard lines that are mostly non-alphanumeric or too short
+        if len(line) < 4:
+            continue
+        if sum(c.isalnum() for c in line) / max(len(line), 1) < 0.4:
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
 def find_nearest_caption(text_blocks, img_bbox):
     """Heuristic: caption is the closest text block vertically."""
     ix0, iy0, ix1, iy1 = img_bbox
@@ -43,7 +52,6 @@ def find_nearest_caption(text_blocks, img_bbox):
     best_dist = 999999
     for tb in text_blocks:
         tx0, ty0, tx1, ty1 = tb["bbox"]
-        # vertical distance between image and text block
         dist = min(abs(ty0 - iy1), abs(iy0 - ty1))
         if dist < best_dist:
             best_dist = dist
@@ -61,7 +69,7 @@ def collect_nearby_text(text_blocks, img_bbox, threshold=80):
     return "\n".join(collected)
 
 def chunk_page_text(page_text, page_number):
-    """Use your existing splitters to chunk normal text."""
+    """Use existing splitters to chunk normal text."""
     character_splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", ". ", " ", ""],
         chunk_size=1000,
@@ -109,13 +117,14 @@ def parse_pdf_to_chunks(pdf_path):
             img_bytes = pix.tobytes("png")
             image = Image.open(io.BytesIO(img_bytes))
 
-            # OCR (optional)
-            ocr_text = pytesseract.image_to_string(image).strip()
+            # OCR (with cleaning)
+            raw_ocr = pytesseract.image_to_string(image)
+            ocr_text = clean_ocr_text(raw_ocr)
 
             # Image bbox (PyMuPDF 1.23+)
             try:
                 img_bbox = page.get_image_bbox(img)
-            except:
+            except Exception:
                 continue
 
             # Caption + nearby text
@@ -142,13 +151,13 @@ def parse_pdf_to_chunks(pdf_path):
     return chunks
 
 # ---------------------------------------------------------------------------
-# LLM: context-aware query expansion
+# LLM: context-aware query expansion (FIX 1 & 2)
 # ---------------------------------------------------------------------------
 
 def generate_context_aware_queries(user_query, retrieved_docs, model="gpt-3.5-turbo"):
     context = "\n\n".join(retrieved_docs[:3])
     prompt = f"""
-You are a ceramics artist assistant working with ceramic glaze composition data.
+You are a ceramics and glaze chemistry assistant.
 
 The user asked:
 "{user_query}"
@@ -158,11 +167,17 @@ Below are excerpts retrieved from the document:
 {context}
 ---
 
-Generate up to five grounded follow-up questions.
-Each on its own line.
+Based on BOTH the user question and the retrieved content,
+generate up to five follow-up questions that:
+- explore different angles of the same topic,
+- stay grounded in the retrieved content,
+- avoid speculation,
+- are concise and single-topic.
+
+List each question on a separate line without numbering.
 """
     messages = [
-        {"role": "system", "content": "You generate grounded queries."},
+        {"role": "system", "content": "You generate grounded ceramics/glaze queries."},
         {"role": "user", "content": prompt},
     ]
     response = client.chat.completions.create(model=model, messages=messages)
@@ -174,16 +189,18 @@ Each on its own line.
 
 def generate_final_answer(original_query, context, model="gpt-3.5-turbo"):
     prompt = f"""
-Answer the user's question using ONLY the following excerpts:
+You are a ceramics artist. Answer the user's question using ONLY the following excerpts from a ceramics glaze composition report. 
+If the information is not in the excerpts, say so clearly.
 
+Excerpts:
 {context}
 
 User question: {original_query}
 
-Provide one concise answer.
+Provide one concise, direct answer. Do not speculate beyond the excerpts.
 """
     messages = [
-        {"role": "system", "content": "You answer using only provided excerpts."},
+        {"role": "system", "content": "You answer questions based only on the provided document excerpts."},
         {"role": "user", "content": prompt},
     ]
     response = client.chat.completions.create(model=model, messages=messages)
@@ -213,54 +230,67 @@ if collection.count() == 0:
 
 # ---------------------------------------------------------------------------
 # Retrieval → expansion → joint retrieval → reranking → final answer
+# (FIX 1, 3, 4)
 # ---------------------------------------------------------------------------
 
-INITIAL_QUERY = "What are the materials used in Temmoku glaze?"
-ORIGINAL_QUERY = "What are the materials used in Temmoku glaze?"
+ORIGINAL_QUERY = "What is the recipe for temmoku glaze?"
 TOP_K_RERANK = 5
 N_RESULTS_PER_QUERY = 10
 
-# Initial retrieval
+# Initial retrieval driven by ORIGINAL_QUERY (FIX 1)
 initial = collection.query(
-    query_texts=[INITIAL_QUERY],
+    query_texts=[ORIGINAL_QUERY],
     n_results=5,
-    include=["documents"],
+    include=["documents", "metadatas"],
 )
 retrieved_for_expansion = initial["documents"][0]
 
-# Query expansion
-aug_queries = generate_context_aware_queries(INITIAL_QUERY, retrieved_for_expansion)
+# Query expansion grounded in ORIGINAL_QUERY (FIX 1 & 2)
+aug_queries = generate_context_aware_queries(ORIGINAL_QUERY, retrieved_for_expansion)
 
-# Joint retrieval
-joint = [ORIGINAL_QUERY] + aug_queries
+# Joint retrieval, but we’ll prefer section chunks via metadata (FIX 3)
+joint_queries = [ORIGINAL_QUERY] + aug_queries
 
 results = collection.query(
-    query_texts=joint,
+    query_texts=joint_queries,
     n_results=N_RESULTS_PER_QUERY,
-    include=["documents"],
+    include=["documents", "metadatas"],
 )
 
-# Deduplicate
-unique_docs = set()
-for lst in results["documents"]:
-    for d in lst:
-        unique_docs.add(d)
-unique_docs = list(unique_docs)
+retrieved_docs_lists = results["documents"]
+retrieved_meta_lists = results["metadatas"]
 
-# Rerank
+# Deduplicate with metadata
+unique = {}
+for docs_list, metas_list in zip(retrieved_docs_lists, retrieved_meta_lists):
+    for d, m in zip(docs_list, metas_list):
+        if d not in unique:
+            unique[d] = m
+
+unique_docs = list(unique.keys())
+unique_metas = [unique[d] for d in unique_docs]
+
+# Simple downweighting of figure chunks before reranking (FIX 4)
+# We’ll pass all to cross-encoder but later bias toward sections.
 cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 pairs = [[ORIGINAL_QUERY, d] for d in unique_docs]
 scores = cross_encoder.predict(pairs)
+
+# Apply a small penalty to figure chunks
+for i, meta in enumerate(unique_metas):
+    if meta.get("type") == "figure":
+        scores[i] -= 0.2  # downweight figures slightly
+
+# Prefer section chunks overall by sorting with adjusted scores (FIX 3 & 4)
 top_idx = np.argsort(scores)[::-1][:TOP_K_RERANK]
 top_docs = [unique_docs[i] for i in top_idx]
 
-# Final answer
 context = "\n\n".join(top_docs)
 final_answer = generate_final_answer(ORIGINAL_QUERY, context)
 
 print("Augmented queries:")
 for q in aug_queries:
-    print(" -", q)
+    print(f"  - {q}")
 
 print("\nFinal answer:")
 print(final_answer)
