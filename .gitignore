@@ -2,6 +2,7 @@
 # ignore the venv directory
 venv/
 myenv/
+.streamlit/
 
 # ignore the .vscode directory
 .vscode/
