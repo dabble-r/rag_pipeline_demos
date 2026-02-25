@@ -1,8 +1,7 @@
 
 def rag_pipeline(
     user_query: str,
-    *,
-    pdf_path: str = "",
+    pdf_path: str,
     collection_name: str = "glaze-collection",
     top_k_rerank: int = 5,
     n_results_per_query: int = 10,
@@ -29,9 +28,10 @@ def rag_pipeline(
         openai_api_key: Override for OpenAI API key (default: from env OPENAI_API_KEY).
     """
 
+    
+    import re
     import os
     import io
-    import re
     import numpy as np
     from dotenv import load_dotenv
     from openai import OpenAI
@@ -46,6 +46,7 @@ def rag_pipeline(
     from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
 
     load_dotenv()
+    os.environ["OPENAI_API_KEY"] = openai_api_key
     client = OpenAI(api_key=openai_api_key)
 
     # ---------------------------------------------------------------------------
@@ -139,28 +140,282 @@ def rag_pipeline(
 
     # ---------------------------------------------------------------------------
     # IMPROVED RAWDICT PARSER (TEXT ONLY — IMAGES DROPPED)
+    # DEPRECATED: USE parse_pdf_to_chunks_proposed INSTEAD
     # ---------------------------------------------------------------------------
 
-    def parse_pdf_to_chunks(pdf_path, user_query=None):
-        pdf_document = pdf_path
-        doc = fitz.open(pdf_document)
+    def parse_pdf_to_chunks(
+      pdf_path: str,
+      user_query=None,
+      use_ocr_fallback: bool = True,
+      dpi: int = 150,
+      ocr_min_len: int = 10,
+      ) -> list[dict]:
+          """
+          Parse a PDF into chunks (text layer + optional OCR for empty/short pages).
+          Merges behavior of pdf_to_single_string and parse_pdf_to_chunks: correct
+          page API, OCR when needed, and chunk list with metadata for RAG.
 
-        chunks = []
+          Args:
+              pdf_path: Path to the PDF file.
+              user_query: Unused; kept for API compatibility with callers that pass it.
+              use_ocr_fallback: If True, run OCR on a page when its text layer length < ocr_min_len.
+              dpi: Resolution for rendering pages when running OCR.
+              ocr_min_len: Run OCR when page text length is below this (default 20).
 
-        for page_idx in range(doc.page_count):
-            raw = doc.get_page_text(page_idx)
-            page_text = (raw or "").strip()
-            if not page_text:
+          Returns:
+              List of {"text": str, "metadata": {"page": int, "type": str}}.
+              For a single string: "\\n\\n".join(c["text"] for c in chunks).
+          """
+          doc = fitz.open(pdf_path)
+          chunks = []
+
+          for page_idx in range(len(doc)):
+              page = doc[page_idx]
+              raw = page.get_text()
+              # print("raw page sample: ", raw)
+
+              text = (raw or "").strip()
+              #print("text page sample: ", text)
+
+              if use_ocr_fallback and len(text) < ocr_min_len:
+                  try:
+                      pix = page.get_pixmap(dpi=dpi)
+                      img_bytes = pix.tobytes("png")
+                      image = Image.open(io.BytesIO(img_bytes))
+                      text = (pytesseract.image_to_string(image) or "").strip()
+                      # print("ocr text page sample: ", text)
+                  except Exception:
+                      pass
+
+              if text:
+                  chunks.append({
+                      "text": text,
+                      "metadata": {"page": page_idx + 1, "type": "section"},
+                  })
+
+          doc.close()
+          return chunks
+
+
+    # ---------------------------------------------------------------------------
+    # DYNAMIC PARSE STRATEGY (document-derived thresholds, no hardcoding)
+    # ---------------------------------------------------------------------------
+
+    def _clean_line_for_parse(line: str, collapse_internal_punct: bool = True) -> str:
+        """Generic line cleaning: strip, collapse leading/trailing punctuation, normalize spaces."""
+        import re
+        s = line.strip()
+        if not s:
+            return s
+        # Collapse internal whitespace to single space
+        s = re.sub(r"\s+", " ", s)
+        # Strip leading/trailing non-letter sequences (punctuation/symbols)
+        s = re.sub(r"^[\W_]+", "", s)
+        s = re.sub(r"[\W_]+$", "", s)
+        if collapse_internal_punct:
+            # Collapse runs of same non-alphanumeric character only
+            s = re.sub(r"([\W_])\1+", r"\1", s)
+        return s.strip()
+
+    def _line_features(line: str) -> dict:
+        """Per-line features for document-level outlier detection."""
+        if not line:
+            return {"length": 0, "alnum_ratio": 0.0, "max_same_run": 0, "repeat_score": 0.0}
+        length = len(line)
+        alnum = sum(1 for c in line if c.isalnum())
+        alnum_ratio = alnum / length if length else 0.0
+        # Max run of same character
+        max_run = 0
+        run = 0
+        prev = None
+        for c in line:
+            if c == prev:
+                run += 1
+            else:
+                run = 1
+                prev = c
+            max_run = max(max_run, run)
+        # Repeat-pattern score: max count of any 2-char substring / length (bounded)
+        repeat_score = 0.0
+        if length >= 2:
+            from collections import Counter
+            pairs = [line[i : i + 2] for i in range(length - 1)]
+            if pairs:
+                cnt = Counter(pairs)
+                most = max(cnt.values()) if cnt else 0
+                repeat_score = most / length
+        return {"length": length, "alnum_ratio": alnum_ratio, "max_same_run": max_run, "repeat_score": repeat_score}
+
+    def _is_ingredient_quantity_line(cleaned: str) -> bool:
+        """True if line looks like 'ingredient filler quantity' (at least one letter, ends with digits optional decimal/%)."""
+        import re
+        if not cleaned or not cleaned.strip():
+            return False
+        return bool(re.search(r"[A-Za-z]", cleaned) and re.search(r"\d+\.?\d*%?\s*$", cleaned))
+
+    def _parse_ingredient_quantity_line(cleaned: str):
+        """If line matches 'ingredient filler quantity', return (ingredient, quantity); else None."""
+        import re
+        m = re.search(r"^(.+?)[\W_]+(\d+\.?\d*%?)\s*$", cleaned)
+        if not m:
+            return None
+        left = m.group(1).strip()
+        right = m.group(2).strip()
+        if not left or not re.search(r"[A-Za-z]", left):
+            return None
+        return (left, right)
+
+    def _apply_dynamic_strategy(
+        lines_by_page: list,
+        min_len: int = 1,
+        p_ratio_low: float = 5.0,
+        p_same_run_high: float = 95.0,
+        use_repeat_heuristic: bool = True,
+        p_repeat_high: float = 95.0,
+        collapse_internal_punct: bool = True,
+    ) -> list[dict]:
+        """
+        Apply document-derived thresholds: collect features from all lines, compute percentiles,
+        drop outlier lines, reassemble per page. Returns list of {"text": str, "metadata": {"page": int, "type": str}}.
+        Collapse (internal punctuation) is applied before computing features so "ingredient _____ quantity"
+        lines are not dropped as garbage.
+        """
+        # Collect (page_idx, line, is_blank) for all lines
+        all_items = []
+        for page_idx, line_list in lines_by_page:
+            for line, is_blank in line_list:
+                all_items.append((page_idx, line, is_blank))
+
+        # Clean non-blank lines and compute features
+        non_blank_features = []
+        cleaned_per_item = []
+        for page_idx, line, is_blank in all_items:
+            if is_blank:
+                cleaned_per_item.append((page_idx, "", True))
                 continue
+            cleaned = _clean_line_for_parse(line, collapse_internal_punct=collapse_internal_punct)
+            cleaned_per_item.append((page_idx, cleaned, False))
+            if cleaned:
+                feats = _line_features(cleaned)
+                non_blank_features.append(feats)
 
-            chunks.append({
-                "text": page_text,
-                "metadata": {"page": page_idx + 1, "type": "section"},
-            })
+        if not non_blank_features:
+            # No non-blank lines; return one chunk per page with empty or original text
+            pages_seen = {}
+            for page_idx, _c, _b in cleaned_per_item:
+                pages_seen.setdefault(page_idx, [])
+            return [{"text": "", "metadata": {"page": p + 1, "type": "section"}} for p in sorted(pages_seen.keys())]
 
+        # Document-level percentiles
+        ratios = [f["alnum_ratio"] for f in non_blank_features]
+        same_runs = [f["max_same_run"] for f in non_blank_features]
+        repeat_scores = [f["repeat_score"] for f in non_blank_features]
+        p5_ratio = float(np.percentile(ratios, p_ratio_low))
+        p95_same = float(np.percentile(same_runs, p_same_run_high))
+        p95_repeat = float(np.percentile(repeat_scores, p_repeat_high)) if use_repeat_heuristic else 1.0
+
+        # Mark each item keep/drop (recompute features for cleaned lines to align with percentiles)
+        kept_items = []
+        for page_idx, cleaned, is_blank in cleaned_per_item:
+            if is_blank:
+                kept_items.append((page_idx, "", True, True))
+                continue
+            if not cleaned:
+                kept_items.append((page_idx, cleaned, False, False))
+                continue
+            feats = _line_features(cleaned)
+            drop = (
+                feats["alnum_ratio"] < p5_ratio
+                or feats["max_same_run"] > p95_same
+                or feats["length"] < min_len
+                or (use_repeat_heuristic and feats["repeat_score"] > p95_repeat)
+            )
+            # Protect "ingredient _____ quantity" lines: do not drop even if heuristics say garbage
+            if _is_ingredient_quantity_line(cleaned):
+                drop = False
+            kept_items.append((page_idx, cleaned, False, not drop))
+
+        # Reassemble per page: group by page_idx, join kept lines preserving blanks
+        from itertools import groupby
+        page_blocks = []
+        for page_idx, group in groupby(kept_items, key=lambda x: x[0]):
+            page_lines = []
+            ingredient_quantities = []
+            for _, cleaned, is_blank, keep in group:
+                if is_blank:
+                    page_lines.append("\n\n")
+                elif keep:
+                    page_lines.append(cleaned)
+                    pair = _parse_ingredient_quantity_line(cleaned)
+                    if pair:
+                        ingredient_quantities.append(pair)
+            text = "\n".join(page_lines).replace("\n\n\n", "\n\n").strip()
+            meta = {"page": page_idx + 1, "type": "section"}
+            if ingredient_quantities:
+                import json
+                meta["ingredient_quantities"] = json.dumps(ingredient_quantities)
+            if text:
+                page_blocks.append({"text": text, "metadata": meta})
+
+        return page_blocks
+
+    def parse_pdf_to_chunks_proposed(
+        pdf_path: str,
+        user_query=None,
+        use_ocr_fallback: bool = True,
+        dpi: int = 150,
+        ocr_min_len: int = 20,
+        min_line_len: int = 1,
+        p_ratio_low: float = 5.0,
+        p_same_run_high: float = 95.0,
+        use_repeat_heuristic: bool = True,
+        p_repeat_high: float = 95.0,
+        collapse_internal_punct: bool = True,
+    ) -> list[dict]:
+        """
+        Parse PDF into chunks using merged flow (text layer + OCR fallback) then apply
+        dynamic parse strategy: document-derived thresholds, generic cleaning, no hardcoding.
+        Same return shape as parse_pdf_to_chunks; use this for robust OCR/post-parse.
+        """
+        doc = fitz.open(pdf_path)
+        # 1) Get page texts (same as parse_pdf_to_chunks_merged)
+        page_texts = []
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            raw = page.get_text()
+            text = (raw or "").strip()
+            if use_ocr_fallback and len(text) < ocr_min_len:
+                try:
+                    pix = page.get_pixmap(dpi=dpi)
+                    img_bytes = pix.tobytes("png")
+                    image = Image.open(io.BytesIO(img_bytes))
+                    text = (pytesseract.image_to_string(image) or "").strip()
+                    # print("ocr text page sample: ", text)
+                except Exception:
+                    pass
+            page_texts.append((page_idx, text))
         doc.close()
-        return chunks
 
+        # 2) Split each page into lines and record blanks (structure)
+        lines_by_page = []
+        for page_idx, text in page_texts:
+            line_list = []
+            for raw_line in text.splitlines():
+                # print("raw line sample: ", raw_line)
+                is_blank = not raw_line.strip()
+                line_list.append((raw_line, is_blank))
+            lines_by_page.append((page_idx, line_list))
+
+        # 3) Apply dynamic strategy and return chunks
+        return _apply_dynamic_strategy(
+            lines_by_page,
+            min_len=min_line_len,
+            p_ratio_low=p_ratio_low,
+            p_same_run_high=p_same_run_high,
+            use_repeat_heuristic=use_repeat_heuristic,
+            p_repeat_high=p_repeat_high,
+            collapse_internal_punct=collapse_internal_punct,
+        )
 
     # ---------------------------------------------------------------------------
     # IMPROVED CHUNKING (NO OVER-FRAGMENTATION)
@@ -236,18 +491,16 @@ def rag_pipeline(
     # BUILD INDEX
     # ---------------------------------------------------------------------------
 
-    raw_groups = parse_pdf_to_chunks(pdf_path, user_query)
+    raw_groups = parse_pdf_to_chunks_proposed(pdf_path, user_query)
     # print("raw groups:", raw_groups)
-
 
     docs = []
     metas = []
     for g in raw_groups:
         page = g["metadata"]["page"]
-        # print("page: ", page)
         for ch in chunk_text(g["text"], page):
             docs.append(ch["text"])
-            metas.append(ch["metadata"])
+            metas.append({**ch["metadata"], **g["metadata"]})
 
     # for i, d in enumerate(docs[:3]):
     #    print("CHUNK", i, "\n", d[:500], "\n---\n")
@@ -347,8 +600,14 @@ def rag_pipeline(
 
 
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+
     result = rag_pipeline(
-        "answer",
-        "To experiment with glaze recipes, which recipe is the best starting point?",
+        "Which materials tend to produce crystals in a glaze?",
+        "data/ceramics.pdf",
+        openai_api_key=openai_api_key,
     )
     print("result: ", result)

@@ -39,7 +39,7 @@ with st.sidebar:
         st.write("OpenAI API key saved")
 
     st.title("Doc Upload")
-    st.session_state.pdf_path = st.file_uploader("", type=["pdf"])
+    st.session_state.pdf_path = st.file_uploader("Upload a PDF", type=["pdf"], label_visibility="visible")
     print("pdf_path: ", st.session_state.pdf_path)
 
 # search button
@@ -50,7 +50,12 @@ if st.button("Query") and st.session_state.open_api_key:
         with open(full_path, "wb") as f:
           f.write(st.session_state.pdf_path.getvalue())
 
-        result = rag_pipeline(st.session_state.query, pdf_path=full_path, openai_api_key=st.session_state.open_api_key)
+        result = rag_pipeline(
+            "answer",
+            st.session_state.query,
+            pdf_path=full_path,
+            openai_api_key=st.session_state.open_api_key,
+        )
         st.write(result)
     else:
         st.write("Please upload a PDF file")
